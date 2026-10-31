@@ -1,0 +1,46 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html,
+  body,
+  #root {
+    min-height: 100dvh;
+  }
+}
+
+/* Deferred validation styling after user interaction (validate-input-after-interaction) */
+.auth-field .error-msg {
+  display: none;
+  color: #d93025;
+  font-size: 0.8125rem;
+  margin-top: 0.25rem;
+}
+
+.auth-field input:user-invalid,
+.auth-field input.user-invalid-fallback {
+  border-color: #d93025;
+  background-color: #fce8e6;
+}
+
+.auth-field input:user-invalid ~ .error-msg,
+.auth-field input.user-invalid-fallback ~ .error-msg {
+  display: block;
+}
+
+.auth-field input:user-valid,
+.auth-field input.user-valid-fallback {
+  border-color: #188038;
+}
+
+.auth-field:has(input:user-invalid) .rules-list,
+.auth-field:has(input.user-invalid-fallback) .rules-list {
+  color: #d93025;
+  font-weight: 600;
+}
+
+.auth-field:has(input:user-valid) .rules-list,
+.auth-field:has(input.user-valid-fallback) .rules-list {
+  display: none;
+}
