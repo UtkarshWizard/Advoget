@@ -8,7 +8,7 @@
     "start": "tsx src/index.ts",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
-    "test": "tsx src/test-milestone2.ts"
+    "test": "tsx src/test-milestone2.ts && tsx src/test-milestone3.ts"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.49.1",

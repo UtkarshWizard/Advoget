@@ -4,17 +4,23 @@ import rateLimit from "express-rate-limit";
 import helmet from "helmet";
 import { config } from "./config.js";
 import { createRequireAuth, type SupabaseProvider } from "./middleware/auth.js";
+import { createChatRouter } from "./routes/chat.js";
+import { createConversationsRouter } from "./routes/conversations.js";
 import { createMeRouter } from "./routes/me.js";
 import { getSupabaseAdmin } from "./supabase.js";
 
 export interface AppDependencies {
   getSupabase?: SupabaseProvider;
   aiServiceUrl?: string;
+  internalApiKey?: string;
+  dailyMessageCap?: number;
 }
 
 export function createApp(deps: AppDependencies = {}): Express {
   const getSupabase = deps.getSupabase ?? getSupabaseAdmin;
   const aiServiceUrl = deps.aiServiceUrl ?? config.aiServiceUrl;
+  const internalApiKey = deps.internalApiKey ?? config.internalApiKey;
+  const dailyMessageCap = deps.dailyMessageCap ?? config.dailyMessageCap;
 
   const app = express();
 
@@ -69,7 +75,17 @@ export function createApp(deps: AppDependencies = {}): Express {
   const requireAuth = createRequireAuth(getSupabase);
 
   app.use("/api/me", requireAuth, createMeRouter(getSupabase));
+  app.use("/api/conversations", requireAuth, createConversationsRouter(getSupabase));
+  app.use(
+    "/api/chat",
+    requireAuth,
+    createChatRouter({
+      getSupabase,
+      aiServiceUrl,
+      internalApiKey,
+      dailyMessageCap,
+    })
+  );
 
   return app;
 }
-

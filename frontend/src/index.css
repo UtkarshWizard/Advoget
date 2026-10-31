@@ -10,6 +10,15 @@
   }
 }
 
+/* Auto-growing textarea with stable horizontal width (form-fields-automatically-fit-contents) */
+.composer-textarea {
+  field-sizing: content;
+  height: auto;
+  width: 100%;
+  min-block-size: 2.75lh;
+  max-block-size: 8lh;
+}
+
 /* Deferred validation styling after user interaction (validate-input-after-interaction) */
 .auth-field .error-msg {
   display: none;
