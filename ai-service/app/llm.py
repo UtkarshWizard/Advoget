@@ -1,4 +1,4 @@
-"""OpenRouter client (streaming chat, tool calls, fallback models, friendly rate-limit errors).
+"""OpenRouter client (streaming chat, gate JSON classification, tool calls, fallback models).
 
 Never hardcodes model IDs and never logs message text or document contents.
 """
@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -58,6 +59,120 @@ def _ensure_api_key() -> str:
     return key
 
 
+def extract_json_object(raw_text: str) -> dict[str, Any] | None:
+    """Extract and parse the first JSON object from an LLM response string."""
+    cleaned = raw_text.strip()
+    # Strip optional markdown code fences
+    cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```$", "", cleaned)
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    match = re.search(r"\{[\s\S]*\}", raw_text)
+    if match:
+        try:
+            parsed = json.loads(match.group(0))
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            return None
+    return None
+
+
+async def complete_gate_json(
+    messages: list[dict[str, str]],
+    model_override: str | None = None,
+    transport: httpx.AsyncBaseTransport | None = None,
+) -> dict[str, Any]:
+    """Call the scope gate model at temperature=0 and parse its JSON output.
+
+    Never uses openrouter/free for the gate. Never loops on 429/402.
+    """
+    api_key = _ensure_api_key()
+    if model_override:
+        candidate_models = [model_override]
+    else:
+        candidate_models = [m for m in settings.gate_models_list if m != "openrouter/free"]
+
+    if not candidate_models:
+        raise LLMServiceError(
+            "No gate model configured. Run scripts/pick_models.py --write-env.",
+            code="CONFIG_ERROR",
+        )
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://advoget.local",
+        "X-Title": "Advoget V0 Legal Assistant",
+    }
+    url = f"{settings.openrouter_base_url.rstrip('/')}/chat/completions"
+    last_error = "No gate model returned valid JSON."
+
+    async with httpx.AsyncClient(timeout=25.0, transport=transport) as client:
+        for model_id in candidate_models:
+            payload: dict[str, Any] = {
+                "model": model_id,
+                "messages": messages,
+                "temperature": 0.0,
+                "max_tokens": 250,
+            }
+
+            try:
+                resp = await client.post(url, headers=headers, json=payload)
+                if resp.status_code in (429, 402):
+                    logger.warning("Gate rate/quota limit: status=%d model=%s", resp.status_code, model_id)
+                    raise LLMRateLimitError(
+                        _friendly_rate_limit_message(resp.status_code),
+                        status_code=resp.status_code,
+                    )
+
+                if resp.status_code >= 400:
+                    logger.warning("Gate candidate failed: status=%d model=%s", resp.status_code, model_id)
+                    last_error = f"Model {model_id} returned HTTP {resp.status_code}"
+                    continue
+
+                body = resp.json()
+                if "error" in body and body["error"]:
+                    err_code = int(body["error"].get("code") or 500)
+                    if err_code in (429, 402):
+                        raise LLMRateLimitError(
+                            _friendly_rate_limit_message(err_code),
+                            status_code=err_code,
+                        )
+                    last_error = f"Model {model_id} error {err_code}"
+                    continue
+
+                choices = body.get("choices") or []
+                if not choices:
+                    last_error = f"Model {model_id} returned empty choices"
+                    continue
+
+                msg = choices[0].get("message") or {}
+                content = str(msg.get("content") or "").strip()
+                if not content and msg.get("reasoning"):
+                    content = str(msg.get("reasoning") or "").strip()
+
+                parsed = extract_json_object(content)
+                if parsed and parsed.get("label") in ("legal", "not_legal", "unclear"):
+                    parsed["_model"] = body.get("model") or model_id
+                    return parsed
+
+                last_error = f"Model {model_id} returned non-conforming JSON"
+            except LLMRateLimitError:
+                raise
+            except httpx.HTTPError as exc:
+                logger.warning("HTTP error on gate model=%s: %s", model_id, type(exc).__name__)
+                last_error = f"Network error on {model_id}"
+                continue
+
+    raise LLMServiceError(f"Scope gate failed ({last_error}).", code="GATE_ERROR")
+
+
 async def stream_chat_completion(
     messages: list[dict[str, Any]],
     models: list[str] | None = None,
@@ -69,9 +184,6 @@ async def stream_chat_completion(
     If a model returns 404/400/5xx before streaming begins, tries the next candidate
     in `models` once. If OpenRouter returns 429 or 402, raises LLMRateLimitError immediately
     without retrying.
-    Yields dicts of shape:
-      {"type": "token", "text": "..."}
-      {"type": "usage", "usage": {"llm_calls": 1, "model": "...", "prompt_tokens": int, "completion_tokens": int}}
     """
     api_key = _ensure_api_key()
     candidate_models = models if models is not None else settings.chat_models_list
@@ -92,11 +204,9 @@ async def stream_chat_completion(
     last_error_detail = "All configured models failed."
 
     async with httpx.AsyncClient(timeout=60.0, transport=transport) as client:
-        for idx, primary_model in enumerate(candidate_models):
-            remaining_fallbacks = candidate_models[idx:]
+        for primary_model in candidate_models:
             payload: dict[str, Any] = {
                 "model": primary_model,
-                "models": remaining_fallbacks,
                 "messages": messages,
                 "temperature": temperature,
                 "stream": True,

@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 from app.config import settings
 from app.llm import LLMRateLimitError, LLMServiceError, stream_chat_completion
 from app.prompts import build_system_prompt
+from app.scope import evaluate_scope
 
 app = FastAPI(
     title="Advoget AI Service",
@@ -38,6 +39,7 @@ class ChatStreamRequest(BaseModel):
     audience: Literal["citizen", "lawyer"] = "citizen"
     messages: list[ChatHistoryMessage] = Field(default_factory=list, max_length=10)
     document_ids: list[str] = Field(default_factory=list)
+    doc_previews: list[str] = Field(default_factory=list)
     remaining_budget: int = 4
 
 
@@ -61,7 +63,7 @@ async def ingest_document_stub() -> dict[str, str]:
 
 @app.post("/ai/chat/stream", dependencies=[Depends(verify_internal_key)])
 async def chat_stream(req: ChatStreamRequest) -> StreamingResponse:
-    """Milestone 3: Streaming chat end-to-end with model fallbacks and friendly rate-limit errors."""
+    """Milestone 4: Scope guard (heuristics + LLM gate) before streaming chat."""
 
     async def event_generator() -> AsyncIterator[str]:
         if req.remaining_budget <= 0:
@@ -74,27 +76,105 @@ async def chat_stream(req: ChatStreamRequest) -> StreamingResponse:
             )
             return
 
-        yield format_sse("status", {"stage": "answering"})
+        if not req.messages:
+            yield format_sse(
+                "error",
+                {
+                    "code": "INVALID_INPUT",
+                    "message": "No message provided.",
+                },
+            )
+            return
 
-        llm_messages: list[dict[str, Any]] = [
-            {"role": "system", "content": build_system_prompt(req.audience)},
-            *[
-                {"role": m.role, "content": m.content}
-                for m in req.messages[-10:]
-            ],
+        latest_message = req.messages[-1].content
+        prior_history = [
+            {"role": m.role, "content": m.content}
+            for m in req.messages[:-1]
         ]
 
-        usage_summary: dict[str, Any] = {"llm_calls": 1}
-
         try:
+            # Step 1: Scope Guard (heuristics + LLM gate)
+            yield format_sse("status", {"stage": "checking_scope"})
+
+            scope_res = await evaluate_scope(
+                user_message=latest_message,
+                history=prior_history,
+                has_doc=bool(req.document_ids),
+                doc_previews=req.doc_previews,
+            )
+
+            if scope_res.label == "not_legal":
+                yield format_sse(
+                    "refusal",
+                    {
+                        "message": scope_res.response_message or "",
+                        "scope_label": "not_legal",
+                    },
+                )
+                yield format_sse(
+                    "done",
+                    {
+                        "scope_label": "not_legal",
+                        "usage": {"llm_calls": scope_res.llm_calls},
+                    },
+                )
+                return
+
+            if scope_res.label == "greeting":
+                yield format_sse("token", {"text": scope_res.response_message or ""})
+                yield format_sse("sources", {"items": []})
+                yield format_sse(
+                    "done",
+                    {
+                        "scope_label": "legal",
+                        "usage": {"llm_calls": 0},
+                    },
+                )
+                return
+
+            if scope_res.label == "unclear":
+                yield format_sse("token", {"text": scope_res.response_message or ""})
+                yield format_sse("sources", {"items": []})
+                yield format_sse(
+                    "done",
+                    {
+                        "scope_label": "unclear",
+                        "usage": {"llm_calls": scope_res.llm_calls},
+                    },
+                )
+                return
+
+            # Step 2: Legal in-scope -> Main Chat Model
+            yield format_sse("status", {"stage": "answering"})
+
+            llm_messages: list[dict[str, Any]] = [
+                {"role": "system", "content": build_system_prompt(req.audience)},
+                *[
+                    {"role": m.role, "content": m.content}
+                    for m in req.messages[-10:]
+                ],
+            ]
+
+            usage_summary: dict[str, Any] = {"llm_calls": scope_res.llm_calls + 1}
+
             async for item in stream_chat_completion(messages=llm_messages):
                 if item["type"] == "token":
                     yield format_sse("token", {"text": item["text"]})
                 elif item["type"] == "usage":
-                    usage_summary = item["usage"]
+                    chat_usage = item["usage"]
+                    usage_summary = {
+                        **chat_usage,
+                        "llm_calls": scope_res.llm_calls + int(chat_usage.get("llm_calls", 1)),
+                    }
 
             yield format_sse("sources", {"items": []})
-            yield format_sse("done", {"usage": usage_summary})
+            yield format_sse(
+                "done",
+                {
+                    "scope_label": "legal",
+                    "usage": usage_summary,
+                },
+            )
         except LLMRateLimitError as exc:
             yield format_sse(
                 "error",

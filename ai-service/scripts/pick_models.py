@@ -2,6 +2,7 @@
 """Query OpenRouter's models API for free (:free) models supporting tool calling.
 
 Lists models with their context length, provider, and endpoint uptime/availability,
+probes top candidates when OPENROUTER_API_KEY is available to skip upstream-throttled providers,
 and outputs recommended values for MODEL_GATE, MODEL_CHAT, and MODEL_FALLBACKS.
 Can optionally update ai-service/.env with --write-env.
 """
@@ -20,6 +21,7 @@ from dotenv import load_dotenv
 
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 OPENROUTER_ENDPOINTS_URL = "https://openrouter.ai/api/v1/models/{author}/{slug}/endpoints"
+OPENROUTER_CHAT_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 
 def fetch_openrouter_models(api_key: str | None = None) -> list[dict[str, Any]]:
@@ -57,6 +59,29 @@ def fetch_model_uptime(client: httpx.Client, model_id: str) -> float | None:
         return None
 
 
+def probe_model_live(client: httpx.Client, api_key: str, model_id: str) -> bool:
+    """Send a minimal 5-token probe when API key is configured to verify provider isn't returning 403/429."""
+    headers = {
+        "Authorization": f"Bearer {api_key.strip()}",
+        "Content-Type": "application/json",
+    }
+    try:
+        resp = client.post(
+            OPENROUTER_CHAT_URL,
+            headers=headers,
+            json={
+                "model": model_id,
+                "messages": [{"role": "user", "content": "ok"}],
+                "max_tokens": 5,
+                "temperature": 0,
+            },
+            timeout=10.0,
+        )
+        return resp.status_code == 200
+    except Exception:
+        return False
+
+
 def is_free_model(model: dict[str, Any]) -> bool:
     model_id: str = model.get("id", "")
     if not model_id.endswith(":free"):
@@ -78,39 +103,40 @@ def supports_tool_calling(model: dict[str, Any]) -> bool:
 def estimate_param_billions(model_id: str, name: str) -> float:
     """Heuristic parameter count in billions for sorting smallest/fastest vs strongest."""
     text = f"{model_id} {name}".lower()
-    # Match patterns like 70b, 32b, 27b, 24b, 14b, 12b, 9b, 8b, 7b, 4b, 3b, 1.5b
     matches = re.findall(r"\b(\d+(?:\.\d+)?)b\b", text)
     if matches:
         return max(float(m) for m in matches)
-    if "mini" in text or "flash" in text or "small" in text or "nano" in text:
+    if "mini" in text or "flash" in text or "small" in text or "nano" in text or "lightning" in text:
         return 8.0
-    if "large" in text or "pro" in text:
+    if "large" in text or "pro" in text or "ultra" in text:
         return 70.0
     return 30.0
 
 
 def pick_recommendations(candidates: list[dict[str, Any]]) -> dict[str, Any]:
-    eligible_32k = [c for c in candidates if c["context_length"] >= 32000]
-    pool = eligible_32k if eligible_32k else candidates
+    healthy = [c for c in candidates if c.get("live_ok") is not False]
+    eligible_32k = [c for c in healthy if c["context_length"] >= 32000]
+    pool = eligible_32k if eligible_32k else (healthy or candidates)
 
-    # Sort for gate: smallest/fastest model (4B - 14B preferred) with high uptime & structured output support
+    # Sort for gate: smallest/fastest model (1.5B - 16B) with live_ok + structured output support
     gate_sorted = sorted(
         pool,
         key=lambda c: (
-            0 if 3.0 <= c["params_b"] <= 16.0 else 1,
+            0 if c.get("live_ok") is True else 1,
+            0 if 1.5 <= c["params_b"] <= 16.0 else 1,
             0 if c["supports_structured"] else 1,
-            -(c["uptime"] or 0.0),
             c["params_b"],
+            -(c["uptime"] or 0.0),
         ),
     )
     gate_top3 = [c["id"] for c in gate_sorted[:3]]
     model_gate = gate_top3[0] if gate_top3 else ""
 
-    # Sort for chat: strongest tool-capable free model with >= 32K context and high uptime
+    # Sort for chat: strongest tool-capable free model with >= 32K context
     chat_sorted = sorted(
-        eligible_32k or pool,
+        pool,
         key=lambda c: (
-            -(1 if (c["uptime"] or 100.0) >= 80.0 else 0),
+            0 if c.get("live_ok") is True else 1,
             -c["params_b"],
             -c["context_length"],
             -(c["uptime"] or 0.0),
@@ -131,7 +157,6 @@ def pick_recommendations(candidates: list[dict[str, Any]]) -> dict[str, Any]:
             if len(fallbacks) == 2:
                 break
 
-    # If fewer than 2 distinct providers available, fill with next best distinct models
     if len(fallbacks) < 2:
         for cand in chat_sorted[1:]:
             if cand["id"] != model_chat and cand["id"] not in fallbacks:
@@ -139,7 +164,6 @@ def pick_recommendations(candidates: list[dict[str, Any]]) -> dict[str, Any]:
                 if len(fallbacks) == 2:
                     break
 
-    # Always append openrouter/free as the last-resort fallback for chat only
     if "openrouter/free" not in fallbacks:
         fallbacks.append("openrouter/free")
 
@@ -178,10 +202,11 @@ def main() -> int:
 
     ai_service_dir = Path(__file__).resolve().parent.parent
     load_dotenv(ai_service_dir / ".env")
-    api_key = os.getenv("OPENROUTER_API_KEY")
+    api_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    has_real_key = bool(api_key and "your-key" not in api_key)
 
     print("Querying OpenRouter models API (https://openrouter.ai/api/v1/models)...")
-    all_models = fetch_openrouter_models(api_key)
+    all_models = fetch_openrouter_models(api_key if has_real_key else None)
 
     raw_candidates: list[dict[str, Any]] = []
     for m in all_models:
@@ -200,24 +225,27 @@ def main() -> int:
                     "supports_structured": "structured_outputs" in supported_params
                     or "response_format" in supported_params,
                     "uptime": None,
+                    "live_ok": None,
                 }
             )
 
     raw_candidates.sort(key=lambda c: (-c["context_length"], -c["params_b"]))
 
-    # Fetch uptime for up to top 15 candidates to keep script fast
-    with httpx.Client(timeout=8.0) as client:
+    with httpx.Client(timeout=10.0) as client:
         for cand in raw_candidates[:15]:
             cand["uptime"] = fetch_model_uptime(client, cand["id"])
+            if has_real_key:
+                cand["live_ok"] = probe_model_live(client, api_key, cand["id"])
 
     print(f"\nFound {len(raw_candidates)} free (:free) models with tool calling:\n")
-    print(f"{'MODEL ID':<52} {'CTX':>8} {'EST SIZE':>9} {'JSON/STRUCT':>12} {'UPTIME (30m)':>13}")
-    print("-" * 98)
+    print(f"{'MODEL ID':<50} {'CTX':>8} {'EST SIZE':>9} {'JSON':>6} {'UPTIME':>8} {'LIVE':>6}")
+    print("-" * 92)
     for c in raw_candidates:
-        uptime_str = f"{c['uptime']:.1f}%" if c["uptime"] is not None else "n/a"
+        uptime_str = f"{c['uptime']:.0f}%" if c["uptime"] is not None else "n/a"
         json_str = "yes" if c["supports_structured"] else "no"
+        live_str = "ok" if c["live_ok"] is True else ("err" if c["live_ok"] is False else "-")
         print(
-            f"{c['id']:<52} {c['context_length']:>8} {c['params_b']:>8.1f}B {json_str:>12} {uptime_str:>13}"
+            f"{c['id']:<50} {c['context_length']:>8} {c['params_b']:>8.1f}B {json_str:>6} {uptime_str:>8} {live_str:>6}"
         )
 
     if not raw_candidates:
@@ -241,4 +269,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
